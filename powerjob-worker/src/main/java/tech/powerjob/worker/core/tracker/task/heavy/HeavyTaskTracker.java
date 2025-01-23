@@ -41,7 +41,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * 负责管理 JobInstance 的运行，主要包括任务的派发（MR可能存在大量的任务）和状态的更新
@@ -201,9 +203,9 @@ public abstract class HeavyTaskTracker extends TaskTracker {
                         instanceId, subInstanceId, taskBriefInfo.getLastReportTime(), reportTime, taskId, newStatus);
                 return;
             }
-            // 检查状态转移是否合法，fix issue 404
+            // 检查状态转移是否合法，fix issue 404（20240306：无排队情况下，receive 和 running 几乎会在同一时间触发，导致这两个请求先后顺序几乎无法保证，大概率有此行输出，因此日志级别降级到 INFO）
             if (nTaskStatus.getValue() < taskBriefInfo.getStatus().getValue()) {
-                log.warn("[TaskTracker-{}-{}] receive invalid task status report(taskId={},currentStatus={},newStatus={}), TaskTracker will drop this report.",
+                log.info("[TaskTracker-{}-{}] receive invalid task status report(taskId={},currentStatus={},newStatus={}), TaskTracker will drop this report.",
                         instanceId, subInstanceId, taskId, taskBriefInfo.getStatus().getValue(), newStatus);
                 return;
             }
@@ -298,7 +300,7 @@ public abstract class HeavyTaskTracker extends TaskTracker {
      * @param heartbeatReq ProcessorTracker（任务的执行管理器）发来的心跳包，包含了其当前状态
      */
     public void receiveProcessorTrackerHeartbeat(ProcessorTrackerStatusReportReq heartbeatReq) {
-        log.debug("[TaskTracker-{}] receive heartbeat: {}", instanceId, heartbeatReq);
+        log.debug("[TaskTracker-{}] receive PT's heartbeat: {}", instanceId, heartbeatReq);
         ptStatusHolder.updateStatus(heartbeatReq);
 
         // 上报空闲，检查是否已经接收到全部该 ProcessorTracker 负责的任务
@@ -476,8 +478,10 @@ public abstract class HeavyTaskTracker extends TaskTracker {
 
             // 3. 避免大查询，分批派发任务
             long currentDispatchNum = 0;
+            LongAdder realDispatchNum = new LongAdder();
             long maxDispatchNum = availablePtIps.size() * instanceInfo.getThreadConcurrency() * 2L;
             AtomicInteger index = new AtomicInteger(0);
+            AtomicBoolean skipThisRound = new AtomicBoolean(false);
 
             // 4. 循环查询数据库，获取需要派发的任务
             while (maxDispatchNum > currentDispatchNum) {
@@ -491,7 +495,13 @@ public abstract class HeavyTaskTracker extends TaskTracker {
                     String ptAddress = task.getAddress();
                     if (StringUtils.isEmpty(ptAddress) || RemoteConstant.EMPTY_ADDRESS.equals(ptAddress)) {
                         if (taskNeedByPassTaskTracker()) {
+                            int loopTime = 0;
                             do {
+                                loopTime++;
+                                if (loopTime > 2) {
+                                    skipThisRound.set(true);
+                                    return;
+                                }
                                 ptAddress = availablePtIps.get(index.getAndIncrement() % availablePtIps.size());
                             } while (workerRuntime.getWorkerAddress().equals(ptAddress));
                         } else {
@@ -499,7 +509,13 @@ public abstract class HeavyTaskTracker extends TaskTracker {
                         }
                     }
                     dispatchTask(task, ptAddress);
+                    realDispatchNum.increment();
                 });
+
+                if (skipThisRound.get()) {
+                    log.warn("[TaskTracker-{}] The cluster has no available workers other than master, so this round dispatch is skipped.", instanceId);
+                    break;
+                }
 
                 // 数量不足 或 查询失败，则终止循环
                 if (needDispatchTasks.size() < dbQueryLimit) {
@@ -507,7 +523,10 @@ public abstract class HeavyTaskTracker extends TaskTracker {
                 }
             }
 
-            log.debug("[TaskTracker-{}] dispatched {} tasks,using time {}.", instanceId, currentDispatchNum, stopwatch.stop());
+            long realDispatchNumL = realDispatchNum.longValue();
+            if (realDispatchNumL > 0) {
+                log.info("[TaskTracker-{}] dispatched {} tasks,using time {}.", instanceId, realDispatchNum, stopwatch.stop());
+            }
         }
 
         private boolean taskNeedByPassTaskTracker() {
